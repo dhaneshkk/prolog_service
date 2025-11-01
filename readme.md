@@ -3,6 +3,7 @@
 A lightweight, **multi-core Prolog engine microservice** built with Rust’s [`warp`](https://crates.io/crates/warp) framework and the [`scryer-prolog`](https://crates.io/crates/scryer-prolog) engine.  
 It allows you to send Prolog programs and queries via **HTTP POST** and receive structured **JSON results**.
 
+
 ---
 
 ## 🚀 Features
@@ -31,3 +32,11 @@ It allows you to send Prolog programs and queries via **HTTP POST** and receive 
 git clone https://github.com/yourname/prolog_service.git
 cd prolog_service
 cargo build --release
+
+```bash
+curl -X POST http://localhost:3030/query \
+  -H "Content-Type: application/json" \
+  -d '{"program": "parent(john, mary). parent(mary, alice). ancestor(X,Y) :- parent(X,Y). ancestor(X,Y) :- parent(X,Z), ancestor(Z,Y).", "query": "ancestor(john, Who)."}'
+{"results":[{"Who":"Atom(\"mary\")"},{"Who":"Atom(\"alice\")"},{"result":false}]
+```
+
