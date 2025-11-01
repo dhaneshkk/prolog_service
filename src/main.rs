@@ -2,11 +2,16 @@ use warp::Filter;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use scryer_prolog::{MachineBuilder, StreamConfig, LeafAnswer, Term};
-use std::{collections::BTreeMap, env, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use dotenvy::dotenv;
+use std::env;
+use log::{info, warn, error};
+use flexi_logger::{Duplicate, FileSpec, Logger, Cleanup, Criterion, Naming, Age, WriteMode, LoggerHandle};
+use once_cell::sync::OnceCell;
 
+use std::fs;
+use std::path::Path;
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
     program: String,
@@ -20,44 +25,27 @@ struct QueryResponse {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    // --- 🌿 Load .env and initialize logging ---
-    dotenvy::dotenv().ok();
+    // 🧩 Load environment variables
+    dotenv().ok();
 
-    let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level.parse::<Level>().unwrap_or(Level::INFO))
-        .with_target(false)
-        .with_thread_names(true)
-        .with_line_number(true)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Setting default tracing subscriber failed");
-
-    // --- ⚙️ Configuration ---
-    let port: u16 = env::var("SERVER_PORT")
-        .unwrap_or_else(|_| "3030".to_string())
-        .parse()
+    // Default port = 3030, can override via .env
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
         .unwrap_or(3030);
-
-    let max_jobs: usize = env::var("MAX_CONCURRENT_JOBS")
-        .unwrap_or_else(|_| "4".to_string())
-        .parse()
-        .unwrap_or(4);
 
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
 
-    info!("🚀 Starting Prolog service");
-    info!("🧠 Available CPU threads: {num_threads}");
-    info!("⚙️  Max concurrent Prolog jobs: {max_jobs}");
-    info!("🌍 Listening on http://0.0.0.0:{port}");
-    info!("💚 Health check endpoint: http://0.0.0.0:{port}/health");
+    // 🧾 Initialize rotating logger
+    init_logger();
 
-    let semaphore = Arc::new(Semaphore::new(max_jobs));
+    info!("🚀 Prolog service starting with {num_threads} threads...");
+    info!("🌍 Listening on http://0.0.0.0:{port}/query");
 
-    // --- 🛣️ Routes ---
+    let semaphore = Arc::new(Semaphore::new(num_threads));
+
     let query_route = warp::path("query")
         .and(warp::post())
         .and(warp::body::json())
@@ -81,7 +69,6 @@ async fn main() {
 
     server.await;
     info!("👋 Server stopped cleanly.");
-
 }
 
 fn with_semaphore(
@@ -95,10 +82,11 @@ async fn handle_query(
     semaphore: Arc<Semaphore>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let _permit = semaphore.acquire_owned().await.unwrap();
-    info!("🧩 Received query: {}", req.query);
 
     let program: Arc<String> = Arc::new(req.program);
     let query: Arc<String> = Arc::new(req.query);
+
+    info!("🧩 Handling query: {}", query);
 
     let res = tokio::task::spawn_blocking({
         let program = Arc::clone(&program);
@@ -108,17 +96,16 @@ async fn handle_query(
         .await;
 
     match res {
-        Ok(Ok(results)) => {
-            info!("✅ Query executed successfully with {} result(s)", results.len());
-            Ok(warp::reply::json(&QueryResponse { results }))
-        }
+        Ok(Ok(results)) => Ok(warp::reply::json(&QueryResponse { results })),
         Ok(Err(err_msg)) => {
-            warn!("⚠️ Query execution failed: {}", err_msg);
+            error!("❌ Query error: {}", err_msg);
             Ok(warp::reply::json(&json!({ "error": err_msg })))
         }
         Err(join_err) => {
-            error!("💥 Task join error: {}", join_err);
-            Ok(warp::reply::json(&json!({ "error": format!("Task join error: {join_err}") })))
+            error!("❌ Task join error: {:?}", join_err);
+            Ok(warp::reply::json(&json!({
+                "error": format!("Task join error: {join_err}")
+            })))
         }
     }
 }
@@ -127,7 +114,6 @@ fn run_query(program: &str, query: &str) -> Result<Vec<serde_json::Value>, Strin
     let streams = StreamConfig::in_memory();
     let mut machine = MachineBuilder::new().with_streams(streams).build();
 
-    // Consult program (no longer returns Result)
     machine.consult_module_string("user", program);
 
     let query_iter = machine.run_query(query);
@@ -143,11 +129,7 @@ fn run_query(program: &str, query: &str) -> Result<Vec<serde_json::Value>, Strin
             Ok(LeafAnswer::LeafAnswer { bindings, .. }) => {
                 results.push(convert_bindings_to_json(bindings))
             }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                error!("Prolog execution error: {}", err_str);
-                results.push(json!({ "error": err_str }));
-            }
+            Err(e) => results.push(json!({ "error": format!("{:?}", e) })),
         }
     }
 
@@ -162,7 +144,6 @@ fn convert_bindings_to_json(bindings: BTreeMap<String, Term>) -> serde_json::Val
     json!(json_map)
 }
 
-/// Recursive and structured converter for Prolog terms → JSON.
 fn term_to_json(term: &Term) -> serde_json::Value {
     match term {
         Term::Integer(i) => json!(i.to_string()),
@@ -170,11 +151,7 @@ fn term_to_json(term: &Term) -> serde_json::Value {
         Term::Float(f) => json!(f),
         Term::Atom(a) => json!(a),
         Term::String(s) => json!(s),
-        Term::List(items) => {
-            let json_items: Vec<serde_json::Value> =
-                items.iter().map(term_to_json).collect();
-            json!(json_items)
-        }
+        Term::List(items) => json!(items.iter().map(term_to_json).collect::<Vec<_>>()),
         Term::Compound(name, args) => json!({
             "functor": name,
             "args": args.iter().map(term_to_json).collect::<Vec<_>>()
@@ -183,3 +160,69 @@ fn term_to_json(term: &Term) -> serde_json::Value {
         _ => json!(format!("{:?}", term)),
     }
 }
+
+/// 🪶 Setup daily rotating logs
+// Global static to keep logger alive
+static LOGGER_HANDLE: OnceCell<LoggerHandle> = OnceCell::new();
+
+pub fn init_logger() {
+    let default_log_dir = "/var/log/prolog_service";
+    let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| {
+        if Path::new(default_log_dir).exists() {
+
+            default_log_dir.to_string()
+        } else {
+            "./logs".to_string()
+        }
+    });
+
+    if let Err(e) = fs::create_dir_all(&log_dir) {
+        eprintln!("⚠️ Failed to create log directory {log_dir}: {e}");
+        eprintln!("👉 Falling back to stderr logging.");
+        let handle = Logger::try_with_env_or_str("info")
+            .unwrap()
+            .duplicate_to_stderr(Duplicate::All)
+            .write_mode(WriteMode::Direct)
+            .start()
+            .unwrap();
+        LOGGER_HANDLE.set(handle).ok();
+        return;
+    }
+
+    let file_spec = FileSpec::default()
+        .directory(&log_dir)
+        .basename("prolog_service")
+        .suffix("log");
+
+    let logger = Logger::try_with_env_or_str("info")
+        .unwrap()
+        .log_to_file(file_spec)
+        .duplicate_to_stderr(Duplicate::Info)
+        .write_mode(WriteMode::Async)
+        .rotate(
+            Criterion::Age(Age::Day),
+            Naming::Timestamps,
+            Cleanup::KeepLogFiles(7),
+        )
+        .start();
+
+    match logger {
+        Ok(handle) => {
+            LOGGER_HANDLE.set(handle).ok(); // Keep it alive globally
+            info!("🪵 Logging initialized successfully in: {log_dir}");
+        }
+        Err(e) => {
+            eprintln!("⚠️ Failed to initialize file logger: {e}");
+            eprintln!("👉 Falling back to stderr logging.");
+            let handle = Logger::try_with_env_or_str("info")
+                .unwrap()
+                .duplicate_to_stderr(Duplicate::All)
+                .write_mode(WriteMode::Direct)
+                .start()
+                .unwrap();
+            LOGGER_HANDLE.set(handle).ok();
+        }
+    }
+}
+
+

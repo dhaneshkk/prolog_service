@@ -1,0 +1,4 @@
+INFO [prolog_service] 🪵 Logging initialized successfully in: ./logs
+INFO [prolog_service] 🚀 Prolog service starting with 32 threads...
+INFO [prolog_service] 🌍 Listening on http://0.0.0.0:3030/query
+INFO [prolog_service] 🧩 Handling query: parent(john, X).

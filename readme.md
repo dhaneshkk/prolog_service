@@ -41,3 +41,22 @@ curl -X POST http://localhost:3030/query \
 ```
 
 curl http://localhost:3030/healthp://localhost:3030/health
+
+sudo mkdir -p /var/log/prolog_service
+sudo chown ubuntu:ubuntu /var/log/prolog_service
+sudo chmod 755 /var/log/prolog_service
+
+
+for testing
+ls -lh ./logs/
+tail -f ./logs/prolog_service_*.log
+
+### For Production on Ubuntu
+
+If you want it under /var/log/prolog_service, make sure the directory and permissions are right:
+
+sudo mkdir -p /var/log/prolog_service
+sudo chown ubuntu:ubuntu /var/log/prolog_service
+sudo chmod 755 /var/log/prolog_service
+
+
