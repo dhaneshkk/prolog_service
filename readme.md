@@ -40,3 +40,4 @@ curl -X POST http://localhost:3030/query \
 {"results":[{"Who":"Atom(\"mary\")"},{"Who":"Atom(\"alice\")"},{"result":false}]
 ```
 
+curl http://localhost:3030/healthp://localhost:3030/health
