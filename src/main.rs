@@ -2,8 +2,10 @@ use warp::Filter;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use scryer_prolog::{MachineBuilder, StreamConfig, LeafAnswer, Term};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, env, sync::Arc};
 use tokio::sync::Semaphore;
+use tracing::{error, info, warn, Level};
+use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
@@ -18,16 +20,44 @@ struct QueryResponse {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // --- 🌿 Load .env and initialize logging ---
+    dotenvy::dotenv().ok();
+
+    let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(log_level.parse::<Level>().unwrap_or(Level::INFO))
+        .with_target(false)
+        .with_thread_names(true)
+        .with_line_number(true)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Setting default tracing subscriber failed");
+
+    // --- ⚙️ Configuration ---
+    let port: u16 = env::var("SERVER_PORT")
+        .unwrap_or_else(|_| "3030".to_string())
+        .parse()
+        .unwrap_or(3030);
+
+    let max_jobs: usize = env::var("MAX_CONCURRENT_JOBS")
+        .unwrap_or_else(|_| "4".to_string())
+        .parse()
+        .unwrap_or(4);
+
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
 
-    println!("🚀 Prolog multi-core service starting with {num_threads} threads...");
-    println!("🌍 Listening on http://0.0.0.0:3030/query");
-    println!("💚 Health check: http://0.0.0.0:3030/health");
+    info!("🚀 Starting Prolog service");
+    info!("🧠 Available CPU threads: {num_threads}");
+    info!("⚙️  Max concurrent Prolog jobs: {max_jobs}");
+    info!("🌍 Listening on http://0.0.0.0:{port}");
+    info!("💚 Health check endpoint: http://0.0.0.0:{port}/health");
 
-    let semaphore = Arc::new(Semaphore::new(num_threads));
+    let semaphore = Arc::new(Semaphore::new(max_jobs));
 
+    // --- 🛣️ Routes ---
     let query_route = warp::path("query")
         .and(warp::post())
         .and(warp::body::json())
@@ -40,15 +70,18 @@ async fn main() {
 
     let routes = query_route.or(health_route);
 
+    // --- 🌙 Graceful shutdown ---
     let (_, server) = warp::serve(routes)
-        .bind_with_graceful_shutdown(([0, 0, 0, 0], 3030), async {
+        .bind_with_graceful_shutdown(([0, 0, 0, 0], port), async {
             tokio::signal::ctrl_c()
                 .await
                 .expect("Failed to listen for shutdown signal");
-            println!("\n👋 Shutting down gracefully...");
+            warn!("🛑 Received termination signal. Shutting down gracefully...");
         });
 
     server.await;
+    info!("👋 Server stopped cleanly.");
+
 }
 
 fn with_semaphore(
@@ -62,6 +95,7 @@ async fn handle_query(
     semaphore: Arc<Semaphore>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let _permit = semaphore.acquire_owned().await.unwrap();
+    info!("🧩 Received query: {}", req.query);
 
     let program: Arc<String> = Arc::new(req.program);
     let query: Arc<String> = Arc::new(req.query);
@@ -74,11 +108,18 @@ async fn handle_query(
         .await;
 
     match res {
-        Ok(Ok(results)) => Ok(warp::reply::json(&QueryResponse { results })),
-        Ok(Err(err_msg)) => Ok(warp::reply::json(&json!({ "error": err_msg }))),
-        Err(join_err) => Ok(warp::reply::json(&json!({
-            "error": format!("Task join error: {join_err}")
-        }))),
+        Ok(Ok(results)) => {
+            info!("✅ Query executed successfully with {} result(s)", results.len());
+            Ok(warp::reply::json(&QueryResponse { results }))
+        }
+        Ok(Err(err_msg)) => {
+            warn!("⚠️ Query execution failed: {}", err_msg);
+            Ok(warp::reply::json(&json!({ "error": err_msg })))
+        }
+        Err(join_err) => {
+            error!("💥 Task join error: {}", join_err);
+            Ok(warp::reply::json(&json!({ "error": format!("Task join error: {join_err}") })))
+        }
     }
 }
 
@@ -86,7 +127,7 @@ fn run_query(program: &str, query: &str) -> Result<Vec<serde_json::Value>, Strin
     let streams = StreamConfig::in_memory();
     let mut machine = MachineBuilder::new().with_streams(streams).build();
 
-    // In current scryer-prolog, this returns `()`
+    // Consult program (no longer returns Result)
     machine.consult_module_string("user", program);
 
     let query_iter = machine.run_query(query);
@@ -102,7 +143,11 @@ fn run_query(program: &str, query: &str) -> Result<Vec<serde_json::Value>, Strin
             Ok(LeafAnswer::LeafAnswer { bindings, .. }) => {
                 results.push(convert_bindings_to_json(bindings))
             }
-            Err(e) => results.push(json!({ "error": format!("{:?}", e) })),
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                error!("Prolog execution error: {}", err_str);
+                results.push(json!({ "error": err_str }));
+            }
         }
     }
 
@@ -117,7 +162,7 @@ fn convert_bindings_to_json(bindings: BTreeMap<String, Term>) -> serde_json::Val
     json!(json_map)
 }
 
-/// Convert `scryer_prolog::Term` into a JSON value (recursive and structured)
+/// Recursive and structured converter for Prolog terms → JSON.
 fn term_to_json(term: &Term) -> serde_json::Value {
     match term {
         Term::Integer(i) => json!(i.to_string()),
@@ -135,7 +180,6 @@ fn term_to_json(term: &Term) -> serde_json::Value {
             "args": args.iter().map(term_to_json).collect::<Vec<_>>()
         }),
         Term::Var(v) => json!({ "var": v }),
-        // Future-proofing: handle any new variants as strings
         _ => json!(format!("{:?}", term)),
     }
 }
